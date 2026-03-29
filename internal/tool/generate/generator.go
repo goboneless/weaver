@@ -2604,11 +2604,8 @@ func formatType(currentPackage *packages.Package, t types.Type) string {
 func sanitize(t types.Type) string {
 	var sanitize func(types.Type) string
 	sanitize = func(t types.Type) string {
+		t = resolveAlias(t)
 		switch x := t.(type) {
-		case *types.Alias:
-			// A type alias is transparent for sanitization purposes.
-			return sanitize(x.Rhs())
-
 		case *types.Pointer:
 			return fmt.Sprintf("ptr_%s", sanitize(x.Elem()))
 
@@ -2682,6 +2679,7 @@ func sanitize(t types.Type) string {
 // int bool`, then TypeString returns "int" for both the named type int and the
 // primitive type int.
 func uniqueName(t types.Type) string {
+	t = resolveAlias(t)
 	switch x := t.(type) {
 	case *types.Pointer:
 		return fmt.Sprintf("*%s", uniqueName(x.Elem()))
@@ -2696,11 +2694,6 @@ func uniqueName(t types.Type) string {
 		keyName := uniqueName(x.Key())
 		valName := uniqueName(x.Elem())
 		return fmt.Sprintf("map[%s]%s", keyName, valName)
-
-	case *types.Alias:
-		// A type alias (e.g. type B = SomeType) is transparent; recurse on the
-		// aliased (RHS) type.
-		return uniqueName(x.Rhs())
 
 	case *types.Named:
 		n := x.TypeArgs().Len()

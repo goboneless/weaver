@@ -254,6 +254,11 @@ func (tset *typeSet) checkSerializable(t types.Type) []error {
 	var check func(t types.Type, path string, record bool) bool
 
 	check = func(t types.Type, path string, record bool) bool {
+		// Resolve type aliases transparently. typeutil.Map treats an alias and
+		// its RHS as identical, so resolving before any cache/stack operations
+		// avoids false-positive "recursive type" detection.
+		t = resolveAlias(t)
+
 		if record {
 			lineage = append(lineage, pathAndType{path, t})
 			defer func() { lineage = lineage[:len(lineage)-1] }()
@@ -285,18 +290,6 @@ func (tset *typeSet) checkSerializable(t types.Type) []error {
 		defer func() { stack.Delete(t) }()
 
 		switch x := t.(type) {
-		case *types.Alias:
-			// A type alias is transparent: check the aliased (RHS) type directly
-			// without going through the stack (since typeutil.Map treats alias and
-			// RHS as identical, the stack would otherwise report false recursion).
-			result := tset.checkSerializable(x.Rhs())
-			tset.checked.Set(t, len(result) == 0)
-			if len(result) > 0 {
-				for _, err := range result {
-					addError(err)
-				}
-			}
-
 		case *types.Named:
 			// No need to check if x is an unexported type from another package
 			// since the Go compiler takes care of that.
@@ -418,16 +411,12 @@ func (tset *typeSet) sizeOfType(t types.Type) int {
 	//   s(struct{..., fi:ti, ...}) = sum of s(ti), if every ti is fixed size
 	//   s(type t u) = s(u)
 	//   s(_) = -1
+	t = resolveAlias(t)
 	if size := tset.sizes.At(t); size != nil {
 		return size.(int)
 	}
 
 	switch x := t.(type) {
-	case *types.Alias:
-		size := tset.sizeOfType(x.Rhs())
-		tset.sizes.Set(t, size)
-		return size
-
 	case *types.Basic:
 		switch x.Kind() {
 		case types.Bool, types.Int8, types.Uint8:
@@ -509,14 +498,12 @@ func (tset *typeSet) isMeasurable(t types.Type) bool {
 	//     m(weaver.AutoMarshal) = true
 	//     m(type t u) = m(u), if t is package local
 	//     m(_) = false
+	t = resolveAlias(t)
 	if result := tset.measurable.At(t); result != nil {
 		return result.(bool)
 	}
 
 	switch x := t.(type) {
-	case *types.Alias:
-		tset.measurable.Set(t, tset.isMeasurable(x.Rhs()))
-
 	case *types.Basic:
 		switch x.Kind() {
 		case types.Bool,
