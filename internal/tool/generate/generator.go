@@ -771,8 +771,12 @@ func validateMethods(pkg *packages.Package, tset *typeSet, intf *types.Named) er
 		}
 
 		// All arguments but context.Context must be serializable.
+		// Function types are allowed for local-only (in-process) calls.
 		for i := 1; i < t.Params().Len(); i++ {
 			arg := t.Params().At(i)
+			if isFuncType(arg.Type()) {
+				continue
+			}
 			if err := errors.Join(tset.checkSerializable(arg.Type())...); err != nil {
 				// TODO(mwhittaker): Print a link to documentation on which types are serializable.
 				errs = append(errs, bad("argument",
@@ -789,8 +793,12 @@ func validateMethods(pkg *packages.Package, tset *typeSet, intf *types.Named) er
 		}
 
 		// All results but error must be serializable.
+		// Function types are allowed for local-only (in-process) calls.
 		for i := 0; i < t.Results().Len()-1; i++ {
 			res := t.Results().At(i)
+			if isFuncType(res.Type()) {
+				continue
+			}
 			if err := errors.Join(tset.checkSerializable(res.Type())...); err != nil {
 				// TODO(mwhittaker): Print a link to documentation on which types are serializable.
 				errs = append(errs, bad("return",
@@ -1401,6 +1409,13 @@ func (g *generator) generateClientStubs(p printFn) {
 			p(``)
 			p(`func (s %s) %s(%s) (%s) {`, stub, m.Name(), g.args(mt), g.returns(mt))
 
+			// Methods with function-type arguments cannot be serialized for remote calls.
+			if hasLocalOnlyParams(mt) {
+				p(`	panic("method %s.%s has function-type arguments and can only be called on a local component")`, comp.intfName(), m.Name())
+				p(`}`)
+				continue
+			}
+
 			p(`	// Update metrics.`)
 			p(`	var requestBytes, replyBytes int`)
 			p(`	begin := s.%sMetrics.Begin()`, notExported(m.Name()))
@@ -1881,6 +1896,13 @@ func (g *generator) generateServerStubs(p printFn) {
 			p(`func (s %s) %s(ctx context.Context, args []byte) (res []byte, err error) {`,
 				stub, notExported(m.Name()))
 
+			// Methods with function-type arguments cannot be received over the network.
+			if hasLocalOnlyParams(mt) {
+				p(`	panic("method %s.%s has function-type arguments and can only be called on a local component")`, comp.intfName(), m.Name())
+				p(`}`)
+				continue
+			}
+
 			// Handle errors triggered during execution.
 			p(`	// Catch and return any panics detected during encoding/decoding/rpc.`)
 			p(`	defer func() {`)
@@ -2346,12 +2368,20 @@ func (g *generator) generateEncDecMethods(p printFn) {
 			sig := method.Type().(*types.Signature)
 
 			// Generate for argument types, skipping the context.Context.
+			// Skip function types since they cannot be serialized.
 			for j := 1; j < sig.Params().Len(); j++ {
+				if isFuncType(sig.Params().At(j).Type()) {
+					continue
+				}
 				g.generateEncDecMethodsFor(printer, sig.Params().At(j).Type())
 			}
 
 			// Generate for result types, skipping the error.
+			// Skip function types since they cannot be serialized.
 			for j := 0; j < sig.Results().Len()-1; j++ {
+				if isFuncType(sig.Results().At(j).Type()) {
+					continue
+				}
 				g.generateEncDecMethodsFor(printer, sig.Results().At(j).Type())
 			}
 		}
@@ -2370,6 +2400,10 @@ func (g *generator) generateEncDecMethodsFor(p printFn, t types.Type) {
 
 	ts := g.tset.genTypeString
 	switch x := t.(type) {
+	case *types.Signature:
+		// Function types cannot be serialized and are handled at the call site.
+		return
+
 	case *types.Basic:
 		// Basic types don't need encoding or decoding methods. Instead, we
 		// call methods directly on a codegen.Encoder or codegen.Decoder
@@ -2501,6 +2535,10 @@ func (g *generator) generateEncDecMethodsFor(p printFn, t types.Type) {
 			// enc.EncodeProto(x), dec.DecodeBinaryUnmarshaler(x)).
 			return
 		}
+		if _, ok := x.Underlying().(*types.Signature); ok {
+			// Named function types cannot be serialized.
+			return
+		}
 		// If a named type t is not a struct, e.g. `type t int`, then we
 		// encode and decode values of type by casting it to its underlying
 		// type (e.g., enc.Int(int(x)) where x has type t).
@@ -2567,6 +2605,10 @@ func sanitize(t types.Type) string {
 	var sanitize func(types.Type) string
 	sanitize = func(t types.Type) string {
 		switch x := t.(type) {
+		case *types.Alias:
+			// A type alias is transparent for sanitization purposes.
+			return sanitize(x.Rhs())
+
 		case *types.Pointer:
 			return fmt.Sprintf("ptr_%s", sanitize(x.Elem()))
 
@@ -2655,6 +2697,11 @@ func uniqueName(t types.Type) string {
 		valName := uniqueName(x.Elem())
 		return fmt.Sprintf("map[%s]%s", keyName, valName)
 
+	case *types.Alias:
+		// A type alias (e.g. type B = SomeType) is transparent; recurse on the
+		// aliased (RHS) type.
+		return uniqueName(x.Rhs())
+
 	case *types.Named:
 		n := x.TypeArgs().Len()
 		if n == 0 {
@@ -2703,6 +2750,38 @@ func uniqueName(t types.Type) string {
 	}
 	// TODO(mwhittaker): What about Struct and Interface literals?
 	panic(fmt.Sprintf("unsupported type %v (%T)", t, t))
+}
+
+// isFuncType reports whether t is a function type (either a literal func type
+// or a named type whose underlying type is a function).
+func isFuncType(t types.Type) bool {
+	switch x := t.(type) {
+	case *types.Signature:
+		return true
+	case *types.Named:
+		_, ok := x.Underlying().(*types.Signature)
+		return ok
+	default:
+		return false
+	}
+}
+
+// hasLocalOnlyParams reports whether a method signature contains any
+// function-type parameters or results (excluding the initial context.Context
+// and the final error). Methods with function-type params can only be invoked
+// locally (in-process).
+func hasLocalOnlyParams(sig *types.Signature) bool {
+	for i := 1; i < sig.Params().Len(); i++ {
+		if isFuncType(sig.Params().At(i).Type()) {
+			return true
+		}
+	}
+	for i := 0; i < sig.Results().Len()-1; i++ {
+		if isFuncType(sig.Results().At(i).Type()) {
+			return true
+		}
+	}
+	return false
 }
 
 // notExported sets the first character in the string to lowercase.

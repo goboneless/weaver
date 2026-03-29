@@ -319,7 +319,8 @@ func compile(t *testing.T, contents string) (*typeSet, types.Type) {
 			packages.NeedSyntax |
 			packages.NeedImports |
 			packages.NeedTypes |
-			packages.NeedTypesInfo,
+			packages.NeedTypesInfo |
+			packages.NeedDeps,
 		Dir:  tmp,
 		Fset: fset,
 	}

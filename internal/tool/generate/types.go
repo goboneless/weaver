@@ -285,6 +285,18 @@ func (tset *typeSet) checkSerializable(t types.Type) []error {
 		defer func() { stack.Delete(t) }()
 
 		switch x := t.(type) {
+		case *types.Alias:
+			// A type alias is transparent: check the aliased (RHS) type directly
+			// without going through the stack (since typeutil.Map treats alias and
+			// RHS as identical, the stack would otherwise report false recursion).
+			result := tset.checkSerializable(x.Rhs())
+			tset.checked.Set(t, len(result) == 0)
+			if len(result) > 0 {
+				for _, err := range result {
+					addError(err)
+				}
+			}
+
 		case *types.Named:
 			// No need to check if x is an unexported type from another package
 			// since the Go compiler takes care of that.
@@ -411,6 +423,11 @@ func (tset *typeSet) sizeOfType(t types.Type) int {
 	}
 
 	switch x := t.(type) {
+	case *types.Alias:
+		size := tset.sizeOfType(x.Rhs())
+		tset.sizes.Set(t, size)
+		return size
+
 	case *types.Basic:
 		switch x.Kind() {
 		case types.Bool, types.Int8, types.Uint8:
@@ -497,6 +514,9 @@ func (tset *typeSet) isMeasurable(t types.Type) bool {
 	}
 
 	switch x := t.(type) {
+	case *types.Alias:
+		tset.measurable.Set(t, tset.isMeasurable(x.Rhs()))
+
 	case *types.Basic:
 		switch x.Kind() {
 		case types.Bool,
